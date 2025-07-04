@@ -25,7 +25,7 @@ type model struct {
 	mode          mode
 	duration      time.Duration
 	remaining     time.Duration
-	timer         *time.Timer
+	ticker        *time.Ticker
 	paused        bool
 	input         textinput.Model
 	notes         textarea.Model
@@ -40,7 +40,7 @@ func initialModel() model {
 	ti.Width = 30
 
 	ta := textarea.New()
-	ta.Placeholder = "Notes to keep you on task..."
+	ta.Placeholder = "Notes to stay on track"
 	ta.SetWidth(50)
 	ta.SetHeight(5)
 
@@ -62,71 +62,75 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	switch msg := msg.(type) {
 	case tea.KeyMsg:
+		if m.notes.Focused() {
+			if msg.Type == tea.KeyEsc {
+				m.notes.Blur()
+				return m, nil
+			}
+			m.notes, cmd = m.notes.Update(msg)
+			return m, cmd
+		}
+
 		switch msg.Type {
 		case tea.KeyCtrlC, tea.KeyEsc:
 			return m, tea.Quit
-		}
-
-		if m.notes.Focused() {
-			m.notes, cmd = m.notes.Update(msg)
-			return m, cmd
 		}
 
 		switch m.mode {
 		case modeInput:
 			if msg.Type == tea.KeyEnter {
 				d, err := time.ParseDuration(m.input.Value())
-				if err == nil {
+				if err == nil && d > 0 {
 					m.duration = d
 					m.remaining = d
 					m.mode = modeTimer
-					m.notes.Focus()
+					m.paused = false
+					m.ticker = time.NewTicker(time.Second)
+					cmds = append(cmds, waitForTick(m.ticker.C))
 				}
-				return m, nil
+				return m, tea.Batch(cmds...)
 			}
 			m.input, cmd = m.input.Update(msg)
 			cmds = append(cmds, cmd)
 
 		case modeTimer:
 			switch msg.String() {
-			case "s": // Start
-				if m.timer == nil && m.remaining > 0 {
-					m.paused = false
-					m.timer = time.NewTimer(m.remaining)
-					cmds = append(cmds, waitForTick(m.timer.C))
-				}
 			case "p": // Pause
-				if m.timer != nil && !m.paused {
+				if m.ticker != nil {
 					m.paused = true
-					m.timer.Stop()
+					m.ticker.Stop()
+					m.ticker = nil
 				}
 			case "r": // Resume
-				if m.timer != nil && m.paused {
+				if m.paused && m.remaining > 0 {
 					m.paused = false
-					m.timer.Reset(m.remaining)
-					cmds = append(cmds, waitForTick(m.timer.C))
+					m.ticker = time.NewTicker(time.Second)
+					cmds = append(cmds, waitForTick(m.ticker.C))
 				}
 			case "e": // Edit/Reset
-				if m.timer != nil {
-					m.timer.Stop()
+				if m.ticker != nil {
+					m.ticker.Stop()
+					m.ticker = nil
 				}
-				m.timer = nil
 				m.mode = modeInput
 				m.input.Focus()
+			case "n": // Edit Notes
+				m.notes.Focus()
+				cmds = append(cmds, textarea.Blink)
 			}
 		}
 
 	case tickMsg:
+		if m.paused || m.ticker == nil {
+			break
+		}
 		m.remaining -= time.Second
 		if m.remaining <= 0 {
-			if m.timer != nil {
-				m.timer.Stop()
-			}
-			m.timer = nil
+			m.ticker.Stop()
+			m.ticker = nil
 			m.remaining = 0
 		} else {
-			m.timer.Reset(time.Second)
-			cmds = append(cmds, waitForTick(m.timer.C))
+			cmds = append(cmds, waitForTick(m.ticker.C))
 		}
 
 	case tea.WindowSizeMsg:
@@ -172,7 +176,7 @@ func (m model) View() string {
 
 		b.WriteString(timerStyle.Render(timerStr) + "\n\n")
 
-		help := "s: start | p: pause | r: resume | e: edit/reset | esc: quit"
+		help := "p: pause | r: resume | n: notes (esc to exit) | e: edit | esc: quit"
 		b.WriteString(helpStyle.Render(help))
 	}
 
