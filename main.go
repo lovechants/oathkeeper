@@ -67,6 +67,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, tea.Quit
 		}
 
+		if m.notes.Focused() {
+			m.notes, cmd = m.notes.Update(msg)
+			return m, cmd
+		}
+
 		switch m.mode {
 		case modeInput:
 			if msg.Type == tea.KeyEnter {
@@ -126,12 +131,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
-	}
-
-	// Handle text area updates regardless of mode, unless we are quitting.
-	if m.notes.Focused() {
-		m.notes, cmd = m.notes.Update(msg)
-		cmds = append(cmds, cmd)
 	}
 
 	return m, tea.Batch(cmds...)
