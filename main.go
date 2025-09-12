@@ -510,32 +510,85 @@ func (r *renderModel) handleScripts(content string) string {
 	return result
 }
 
+// All formatting is just hard coded until the parser implementation with proper tokenization or state machine is implemented
 func (r *renderModel) handleFormatting(content string) string {
-	result := content
-	
-	result = strings.ReplaceAll(result, "\\textbf{", "**")
-	result = strings.ReplaceAll(result, "\\textit{", "*")
-	result = strings.ReplaceAll(result, "\\emph{", "*")
-	
-	braceCount := 0
-	var processed strings.Builder
-	for i, char := range result {
-		if char == '{' && i > 0 {
-			braceCount++
-		} else if char == '}' && braceCount > 0 {
-			braceCount--
-			if braceCount == 0 {
-				processed.WriteRune('*')
-				if i > 0 && result[i-1] == '*' {
-					processed.WriteRune('*')
-				}
-				continue
-			}
-		}
-		processed.WriteRune(char)
+	if r.containsMathContent(content) {
+		return content
 	}
 	
-	return processed.String()
+	result := content
+	
+	commands := map[string][2]string{
+		"\\textbf": {"**", "**"},
+		"\\textit": {"*", "*"},
+		"\\emph":   {"*", "*"},
+	}
+	
+	for command, markers := range commands {
+		result = r.processFormattingCommand(result, command, markers[0], markers[1])
+	}
+	
+	return result
+}
+
+func (r *renderModel) containsMathContent(content string) bool {
+	if strings.Contains(content, "$") || 
+	   strings.Contains(content, "\\[") || 
+	   strings.Contains(content, "\\]") {
+		return true
+	}
+	
+	mathCommands := []string{
+		"\\frac", "\\sqrt", "\\sum", "\\int", "\\prod", "\\lim",
+		"\\binom", "\\choose", "\\over", "\\atop", "\\above",
+		"\\matrix", "\\pmatrix", "\\bmatrix", "\\vmatrix",
+	}
+	
+	for _, cmd := range mathCommands {
+		if strings.Contains(content, cmd) {
+			return true
+		}
+	}
+	
+	return false
+}
+
+func (r *renderModel) processFormattingCommand(content, command, openMarker, closeMarker string) string {
+	result := content
+	searchPattern := command + "{"
+	
+	for {
+		pos := strings.Index(result, searchPattern)
+		if pos == -1 {
+			break
+		}
+		
+		braceCount := 1
+		start := pos + len(searchPattern)
+		end := -1
+		
+		for i := start; i < len(result) && braceCount > 0; i++ {
+			if result[i] == '{' {
+				braceCount++
+			} else if result[i] == '}' {
+				braceCount--
+				if braceCount == 0 {
+					end = i
+					break
+				}
+			}
+		}
+		
+		if end != -1 {
+			textContent := result[start:end]
+			replacement := openMarker + textContent + closeMarker
+			result = result[:pos] + replacement + result[end+1:]
+		} else {
+			break 
+		}
+	}
+	
+	return result
 }
 
 func (r *renderModel) validateSyntax(content string) []Diagnostic {
@@ -1780,7 +1833,10 @@ func (m model) exportDocument(filename string, format exportFormat) tea.Cmd {
 
 func (m model) generatePDF(filename string) error {
 	latexContent := m.generateLaTeX()
-	texPath := filepath.Join(m.browser.currentPath, filename+".tex")
+	
+	currentDir := m.browser.currentPath
+	texPath := filepath.Join(currentDir, filename+".tex")
+	pdfPath := filepath.Join(currentDir, filename+".pdf")
 	
 	err := ioutil.WriteFile(texPath, []byte(latexContent), 0644)
 	if err != nil {
@@ -1793,33 +1849,70 @@ func (m model) generatePDF(filename string) error {
 	}
 	
 	oldDir, _ := os.Getwd()
-	os.Chdir(m.browser.currentPath)
+	err = os.Chdir(currentDir)
+	if err != nil {
+		return fmt.Errorf("failed to change directory: %v", err)
+	}
 	defer os.Chdir(oldDir)
 	
 	cmd := exec.Command("pdflatex", "-interaction=nonstopmode", filename+".tex")
-	_, err = cmd.CombinedOutput()
+	output, err := cmd.CombinedOutput()
 	
 	if err != nil {
-		return fmt.Errorf("pdflatex failed: %v", err)
+		m.forceCleanupFiles(currentDir, filename)
+		return fmt.Errorf("pdflatex failed: %v\nOutput: %s", err, string(output))
 	}
 	
-	files, _ := ioutil.ReadDir(".")
-	for _, file := range files {
-		name := file.Name()
-		if strings.HasPrefix(name, filename+".") && 
-		   (strings.HasSuffix(name, ".aux") || 
-		    strings.HasSuffix(name, ".log") || 
-		    strings.HasSuffix(name, ".fls") ||
-		    strings.HasSuffix(name, ".fdb_latexmk") ||
-		    strings.HasSuffix(name, ".synctex.gz") ||
-		    strings.HasSuffix(name, ".out") ||
-		    strings.HasSuffix(name, ".toc") ||
-		    strings.HasSuffix(name, ".tex")) {
-			os.Remove(name)
+	if _, err := os.Stat(pdfPath); os.IsNotExist(err) {
+		m.forceCleanupFiles(currentDir, filename)
+		return fmt.Errorf("PDF was not created despite successful compilation")
+	}
+	
+	m.forceCleanupFiles(currentDir, filename)
+	
+	return nil
+}
+
+func (m model) forceCleanupFiles(dir, filename string) {
+	auxExtensions := []string{
+		".aux", ".log", ".tex", ".out", ".toc", ".lof", ".lot", 
+		".fls", ".fdb_latexmk", ".synctex.gz", ".bbl", ".blg",
+		".idx", ".ind", ".ilg", ".nav", ".snm", ".vrb", ".figlist",
+		".makefile", ".figs", ".pyg", ".pytxcode", ".pytxmcr",
+	}
+	
+	for _, ext := range auxExtensions {
+		filePath := filepath.Join(dir, filename+ext)
+		
+		for attempts := 0; attempts < 3; attempts++ {
+			err := os.Remove(filePath)
+			if err == nil || os.IsNotExist(err) {
+				break 
+			}
+			
+			time.Sleep(50 * time.Millisecond)
 		}
 	}
 	
-	return nil
+
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return
+	}
+	
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, filename+".") && !strings.HasSuffix(name, ".pdf") && !strings.HasSuffix(name, ".oath") {
+			filePath := filepath.Join(dir, name)
+			for attempts := 0; attempts < 3; attempts++ {
+				err := os.Remove(filePath)
+				if err == nil || os.IsNotExist(err) {
+					break
+				}
+				time.Sleep(50 * time.Millisecond)
+			}
+		}
+	}
 }
 
 func (m model) generateLaTeX() string {
